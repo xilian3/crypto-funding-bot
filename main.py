@@ -1,47 +1,51 @@
 import requests
 import time
-from telegram import Bot
 import asyncio
+from telegram import Bot
 
 # =========================================================
 # CONFIG
 # =========================================================
+import os
 
-TELEGRAM_TOKEN = "8789507186:AAHI4J5ofmgd4iZfp8z_cme1qkeiHAvjJss"
-CHAT_ID = "1100102176"
+TELEGRAM_TOKEN = os.getenv("8789507186:AAHI4J5ofmgd4iZfp8z_cme1qkeiHAvjJss
+")
+CHAT_ID = os.getenv("1100102176")
 
-FUNDING_THRESHOLD = -0.0015      # -0.1500%
-PRICE_CHANGE_THRESHOLD = 5       # 5%
-VOLUME_SPIKE_THRESHOLD = 2       # 2x average
-OI_THRESHOLD = 5                 # +5%
-MIN_MARKET_CAP = 100000000   # $1B
+FUNDING_THRESHOLD = -0.0008      # -0.08%
+PRICE_CHANGE_THRESHOLD = 3       # 3%
+OI_THRESHOLD = 2                 # +2%
+MIN_MARKET_CAP = 100000000       # $100M
+MIN_24H_VOLUME = 30000000        # $30M
 
 SCAN_INTERVAL = 300              # 5 minutes
 ALERT_COOLDOWN = 1800            # 30 minutes
 
 # =========================================================
-# TELEGRAM BOT
+# TELEGRAM
 # =========================================================
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-async def send_telegram_alert(message):
+async def send_alert(message):
     await bot.send_message(
         chat_id=CHAT_ID,
         text=message
     )
 
 # =========================================================
-# TRACK LAST ALERT TIME
+# ALERT TRACKER
 # =========================================================
 
 last_alert_time = {}
 
 # =========================================================
-# GET MARKET CAPS FROM COINGECKO
+# MARKET CAPS
 # =========================================================
 
 def get_market_caps():
+
+    print("Fetching market caps...")
 
     url = (
         "https://api.coingecko.com/api/v3/coins/markets"
@@ -51,7 +55,7 @@ def get_market_caps():
         "&page=1"
     )
 
-    response = requests.get(url)
+    response = requests.get(url, timeout=10)
     data = response.json()
 
     market_caps = {}
@@ -63,7 +67,7 @@ def get_market_caps():
     return market_caps
 
 # =========================================================
-# GET BINANCE FUNDING DATA
+# FUNDING DATA
 # =========================================================
 
 def get_funding_data():
@@ -71,10 +75,11 @@ def get_funding_data():
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
 
     response = requests.get(url)
+
     return response.json()
 
 # =========================================================
-# GET 24H TICKER DATA
+# TICKER DATA
 # =========================================================
 
 def get_ticker_data():
@@ -93,10 +98,10 @@ def get_ticker_data():
     return ticker_map
 
 # =========================================================
-# GET OPEN INTEREST
+# OPEN INTEREST CHANGE
 # =========================================================
 
-def get_open_interest(symbol):
+def get_open_interest_change(symbol):
 
     try:
 
@@ -108,6 +113,7 @@ def get_open_interest(symbol):
         )
 
         response = requests.get(url)
+
         data = response.json()
 
         if len(data) < 2:
@@ -116,11 +122,17 @@ def get_open_interest(symbol):
         old_oi = float(data[0]['sumOpenInterest'])
         new_oi = float(data[1]['sumOpenInterest'])
 
+        if old_oi == 0:
+            return 0
+
         oi_change = ((new_oi - old_oi) / old_oi) * 100
 
         return oi_change
 
-    except:
+    except Exception as e:
+
+        print(f"OI Error for {symbol}: {e}")
+
         return 0
 
 # =========================================================
@@ -129,13 +141,17 @@ def get_open_interest(symbol):
 
 async def scan_market():
 
-    print("\nScanning market...\n")
+    print("\n==============================")
+    print("SCANNING MARKET...")
+    print("==============================\n")
 
     market_caps = get_market_caps()
 
     funding_data = get_funding_data()
 
     ticker_data = get_ticker_data()
+
+    candidates_found = 0
 
     for coin in funding_data:
 
@@ -149,7 +165,10 @@ async def scan_market():
 
             funding = float(coin['lastFundingRate'])
 
-            # Funding filter
+            # =================================================
+            # FUNDING FILTER
+            # =================================================
+
             if funding > FUNDING_THRESHOLD:
                 continue
 
@@ -168,25 +187,21 @@ async def scan_market():
                 continue
 
             # =================================================
-            # VOLUME SPIKE
+            # VOLUME FILTER
             # =================================================
 
-            current_volume = float(ticker['quoteVolume'])
+            volume_24h = float(ticker['quoteVolume'])
 
-            avg_volume = current_volume / 24
-
-            volume_ratio = current_volume / avg_volume
-
-            if volume_ratio < VOLUME_SPIKE_THRESHOLD:
+            if volume_24h < MIN_24H_VOLUME:
                 continue
 
             # =================================================
             # MARKET CAP FILTER
             # =================================================
 
-            base_symbol = symbol.replace("USDT", "").lower()
+            base_symbol = symbol.replace("USDT", "").upper()
 
-            market_cap = market_caps.get(base_symbol.upper(), 0)
+            market_cap = market_caps.get(base_symbol, 0)
 
             if market_cap < MIN_MARKET_CAP:
                 continue
@@ -195,7 +210,7 @@ async def scan_market():
             # OPEN INTEREST FILTER
             # =================================================
 
-            oi_change = get_open_interest(symbol)
+            oi_change = get_open_interest_change(symbol)
 
             if oi_change < OI_THRESHOLD:
                 continue
@@ -215,34 +230,49 @@ async def scan_market():
 
             last_alert_time[symbol] = now
 
+            candidates_found += 1
+
             # =================================================
-            # ALERT MESSAGE
+            # DEBUG LOG
+            # =================================================
+
+            print(f"\nMATCH FOUND: {symbol}")
+            print(f"Funding: {funding * 100:.4f}%")
+            print(f"Price Change: {price_change:.2f}%")
+            print(f"24h Volume: ${volume_24h:,.0f}")
+            print(f"OI Change: {oi_change:.2f}%")
+            print(f"Market Cap: ${market_cap:,.0f}")
+
+            # =================================================
+            # TELEGRAM ALERT
             # =================================================
 
             message = f"""
-🚨 EXTREME FUNDING ALERT
+🚨 EXTREME FUNDING EVENT
 
 Coin: {symbol}
 
 Funding Rate: {funding * 100:.4f}%
-24h Price Move: {price_change:.2f}%
-Volume Spike: {volume_ratio:.2f}x
+Price Move: {price_change:.2f}%
 Open Interest Change: {oi_change:.2f}%
 
+24h Volume: ${volume_24h:,.0f}
 Market Cap: ${market_cap:,.0f}
 
 Potential positioning imbalance detected.
 """
 
-            print(message)
-
-            await send_telegram_alert(message)
+            await send_alert(message)
 
         except Exception as e:
+
             print(f"Error processing {coin}: {e}")
 
+    print(f"\nScan completed.")
+    print(f"Candidates found: {candidates_found}")
+
 # =========================================================
-# RUN LOOP
+# MAIN LOOP
 # =========================================================
 
 async def main():
@@ -250,17 +280,19 @@ async def main():
     while True:
 
         try:
+
             await scan_market()
 
         except Exception as e:
-            print("Scanner Error:", e)
 
-        print(f"\nSleeping for {SCAN_INTERVAL} seconds...\n")
+            print(f"\nMAIN LOOP ERROR: {e}")
 
-        time.sleep(SCAN_INTERVAL)
+        print(f"\nSleeping {SCAN_INTERVAL} seconds...\n")
+
+        await asyncio.sleep(SCAN_INTERVAL)
 
 # =========================================================
-# START BOT
+# START
 # =========================================================
 
 asyncio.run(main())
