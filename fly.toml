@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for crypto-funding-bot on 2026-05-19T17:07:01+08:00
+# fly.toml app configuration file generated for crypto-funding-botz on 2026-05-19T22:24:44+08:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'crypto-funding-bot'
+app = 'crypto-funding-botz'
 primary_region = 'sin'
 
 [build]

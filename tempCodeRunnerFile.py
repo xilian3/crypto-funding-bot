@@ -1,1 +1,1 @@
-funding
+TELEGRAM_TOKEN = os.getenv
