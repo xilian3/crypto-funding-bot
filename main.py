@@ -9,9 +9,7 @@ from telegram import Bot
 # CONFIG
 # =========================================================
 
-PRICE_IMPACT_THRESHOLD = 5.0          # 5m price impact >= 5%
-OI_SPIKE_THRESHOLD = 2.0              # 5m open interest increase >= 2%
-MIN_24H_VOLUME = 10_000_000           # Bybit 24h turnover must be >= $10M
+MIN_24H_VOLUME = 50_000_000           # Binance 24h quote volume must be >= $50M
 
 COOLDOWN_HOURS = 8
 COOLDOWN_SECONDS = COOLDOWN_HOURS * 60 * 60
@@ -101,12 +99,7 @@ def get_json(url, params=None):
         )
 
     response.raise_for_status()
-    data = response.json()
-
-    if isinstance(data, dict) and data.get("retCode") not in (0, None):
-        raise ValueError(f"Bybit API error: {data}")
-
-    return data
+    return response.json()
 
 # =========================================================
 # MARKET CAP CACHE
@@ -188,13 +181,11 @@ def get_market_caps():
                 symbol = coin["symbol"].upper()
                 market_cap = coin.get("market_cap", 0) or 0
 
-                # Keep the largest market cap if duplicate symbols exist
                 if symbol not in market_caps:
                     market_caps[symbol] = market_cap
                 else:
                     market_caps[symbol] = max(market_caps[symbol], market_cap)
 
-            # Slow down to avoid CoinGecko free API rate limit
             time.sleep(1.5)
 
         except Exception as e:
@@ -214,18 +205,35 @@ def get_market_caps():
     return {}
 
 # =========================================================
-# BYBIT API DATA
+# BINANCE API DATA
 # =========================================================
 
-def get_bybit_tickers():
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear"}
+def get_binance_funding_data():
+    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+    data = get_json(url)
 
-    data = get_json(url, params=params)
+    funding_map = {}
+
+    for item in data:
+        symbol = item.get("symbol", "")
+
+        if not symbol.endswith("USDT"):
+            continue
+
+        try:
+            funding_map[symbol] = float(item.get("lastFundingRate", 0) or 0)
+        except Exception:
+            funding_map[symbol] = 0.0
+
+    return funding_map
+
+def get_binance_ticker_data():
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    data = get_json(url)
 
     ticker_map = {}
 
-    for item in data["result"].get("list", []):
+    for item in data:
         symbol = item.get("symbol", "")
 
         if not symbol.endswith("USDT"):
@@ -234,66 +242,6 @@ def get_bybit_tickers():
         ticker_map[symbol] = item
 
     return ticker_map
-
-def get_5m_klines(symbol, limit=3):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": "5",
-        "limit": limit,
-    }
-
-    data = get_json(url, params=params)
-    klines = data["result"].get("list", [])
-
-    # Bybit usually returns newest first, so sort oldest -> newest
-    klines.sort(key=lambda x: int(x[0]))
-
-    return klines
-
-def get_5m_price_impact(symbol):
-    klines = get_5m_klines(symbol, limit=3)
-
-    if len(klines) < 2:
-        return 0
-
-    # Use latest closed candle, not currently forming candle
-    last_closed = klines[-2]
-
-    open_price = float(last_closed[1])
-    close_price = float(last_closed[4])
-
-    if open_price == 0:
-        return 0
-
-    return abs((close_price - open_price) / open_price * 100)
-
-def get_open_interest_spike(symbol):
-    url = "https://api.bybit.com/v5/market/open-interest"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "intervalTime": "5min",
-        "limit": 2,
-    }
-
-    data = get_json(url, params=params)
-    oi_list = data["result"].get("list", [])
-
-    if len(oi_list) < 2:
-        return 0
-
-    # Sort oldest -> newest
-    oi_list.sort(key=lambda x: int(x["timestamp"]))
-
-    old_oi = float(oi_list[0]["openInterest"])
-    new_oi = float(oi_list[-1]["openInterest"])
-
-    if old_oi == 0:
-        return 0
-
-    return ((new_oi - old_oi) / old_oi) * 100
 
 # =========================================================
 # MARKET CAP / SYMBOL HELPERS
@@ -304,7 +252,7 @@ def get_market_cap_for_symbol(symbol, market_caps):
 
     candidates = [base_symbol]
 
-    # Handles contracts like 1000PEPEUSDT, 1000BONKUSDT, etc.
+    # Handles contracts like 1000PEPEUSDT, 1000BONKUSDT, 1000SHIBUSDT, etc.
     for prefix in ["1000000", "10000", "1000"]:
         if base_symbol.startswith(prefix):
             candidates.append(base_symbol.replace(prefix, "", 1))
@@ -333,7 +281,7 @@ async def scan_market():
     if not TELEGRAM_TOKEN or not CHAT_ID:
         raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID environment variable.")
 
-    print("Fetching market data from Bybit...")
+    print("Fetching market data from Binance...")
 
     cooldowns = load_cooldowns()
     cooldowns = clean_old_cooldowns(cooldowns)
@@ -344,10 +292,13 @@ async def scan_market():
         print("No market cap data available. Scan stopped.")
         return
 
-    ticker_data = get_bybit_tickers()
+    funding_data = get_binance_funding_data()
+    ticker_data = get_binance_ticker_data()
 
-    candidates_found = 0
     checked_symbols = 0
+    passed_volume = 0
+    passed_funding = 0
+    candidates_found = 0
     skipped_cooldown = 0
 
     for symbol, ticker in ticker_data.items():
@@ -362,52 +313,45 @@ async def scan_market():
                 skipped_cooldown += 1
                 continue
 
+            # =================================================
+            # MARKET CAP FILTER / TIER
+            # =================================================
+
             market_cap, mapped_symbol = get_market_cap_for_symbol(symbol, market_caps)
 
             if market_cap <= 0:
                 continue
 
+            funding_threshold, cap_tier = get_funding_threshold(market_cap)
+
             # =================================================
-            # 24H TURNOVER FILTER
+            # 24H VOLUME FILTER
             # =================================================
 
-            volume_24h = float(ticker.get("turnover24h", 0) or 0)
+            volume_24h = float(ticker.get("quoteVolume", 0) or 0)
 
             if volume_24h < MIN_24H_VOLUME:
                 continue
+
+            passed_volume += 1
 
             # =================================================
             # FUNDING FILTER
             # =================================================
 
-            funding = float(ticker.get("fundingRate", 0) or 0)
-            funding_threshold, cap_tier = get_funding_threshold(market_cap)
+            funding = funding_data.get(symbol)
+
+            if funding is None:
+                continue
 
             if funding > funding_threshold:
                 continue
 
-            # =================================================
-            # PRICE IMPACT FILTER
-            # =================================================
-
-            price_impact = get_5m_price_impact(symbol)
-
-            if price_impact < PRICE_IMPACT_THRESHOLD:
-                continue
-
-            # =================================================
-            # OPEN INTEREST FILTER
-            # =================================================
-
-            oi_spike = get_open_interest_spike(symbol)
-
-            if oi_spike < OI_SPIKE_THRESHOLD:
-                continue
-
+            passed_funding += 1
             candidates_found += 1
 
             message = f"""
-🚨 EXTREME BYBIT PERP SIGNAL
+🚨 EXTREME BINANCE FUNDING SIGNAL
 
 Coin: {symbol}
 Mapped Symbol: {mapped_symbol}
@@ -416,15 +360,12 @@ Tier: {cap_tier}
 Funding Rate: {funding * 100:.4f}%
 Required Funding: {funding_threshold * 100:.4f}%
 
-5m Price Impact: {price_impact:.2f}%
-5m OI Spike: +{oi_spike:.2f}%
-
-24h Bybit Turnover: ${volume_24h:,.0f}
+24h Binance Quote Volume: ${volume_24h:,.0f}
 Market Cap: ${market_cap:,.0f}
 
 Cooldown: {COOLDOWN_HOURS} hours
 
-Possible aggressive positioning imbalance detected.
+Possible extreme negative funding / positioning imbalance detected.
 """
 
             print(message)
@@ -438,6 +379,8 @@ Possible aggressive positioning imbalance detected.
 
     print(
         f"Scan completed. Checked symbols: {checked_symbols}. "
+        f"Passed volume: {passed_volume}. "
+        f"Passed funding: {passed_funding}. "
         f"Candidates found: {candidates_found}. "
         f"Skipped by cooldown: {skipped_cooldown}."
     )
