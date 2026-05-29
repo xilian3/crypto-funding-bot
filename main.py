@@ -3,37 +3,60 @@ import requests
 import asyncio
 from telegram import Bot
 
-PRICE_IMPACT_THRESHOLD = 5.0
-OI_SPIKE_THRESHOLD = 2.0
-VOLUME_SPIKE_MULTIPLIER = 2.0
-MIN_24H_VOLUME = 30_000_000
+# =========================================================
+# CONFIG
+# =========================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")    
+PRICE_IMPACT_THRESHOLD = 5.0          # 5m price impact >= 5%
+OI_SPIKE_THRESHOLD = 2.0              # 5m open interest increase >= 2%
+VOLUME_SPIKE_MULTIPLIER = 2.0         # latest closed 5m volume >= 2x previous average
+MIN_24H_VOLUME = 10_000_000           # Bybit 24h turnover must be >= $10M
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
+# =========================================================
+# TELEGRAM
+# =========================================================
+
 async def send_alert(message):
     await bot.send_message(chat_id=CHAT_ID, text=message)
 
-def get_json(url):
-    response = requests.get(url, timeout=10)
+# =========================================================
+# HTTP HELPERS
+# =========================================================
+
+def get_json(url, params=None):
+    response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+
+    if data.get("retCode") not in (0, None):
+        raise ValueError(f"Bybit API error: {data}")
+
+    return data
+
+# =========================================================
+# MARKET CAP DATA - COINGECKO
+# =========================================================
 
 def get_market_caps():
     market_caps = {}
 
     for page in range(1, 5):
-        url = (
-            "https://api.coingecko.com/api/v3/coins/markets"
-            "?vs_currency=usd"
-            "&order=market_cap_desc"
-            "&per_page=250"
-            f"&page={page}"
-        )
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": page,
+        }
 
-        data = get_json(url)
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
 
         for coin in data:
             symbol = coin["symbol"].upper()
@@ -41,28 +64,51 @@ def get_market_caps():
 
     return market_caps
 
-def get_funding_data():
-    return get_json("https://fapi.binance.com/fapi/v1/premiumIndex")
+# =========================================================
+# BYBIT API DATA
+# =========================================================
 
-def get_ticker_data():
-    data = get_json("https://fapi.binance.com/fapi/v1/ticker/24hr")
-    return {item["symbol"]: item for item in data}
+def get_bybit_tickers():
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear"}
+    data = get_json(url, params=params)
+
+    ticker_map = {}
+
+    for item in data["result"].get("list", []):
+        symbol = item.get("symbol", "")
+
+        if not symbol.endswith("USDT"):
+            continue
+
+        ticker_map[symbol] = item
+
+    return ticker_map
 
 def get_5m_klines(symbol, limit=13):
-    url = (
-        "https://fapi.binance.com/fapi/v1/klines"
-        f"?symbol={symbol}"
-        "&interval=5m"
-        f"&limit={limit}"
-    )
-    return get_json(url)
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": "5",
+        "limit": limit,
+    }
+
+    data = get_json(url, params=params)
+    klines = data["result"].get("list", [])
+
+    # Bybit usually returns newest first, so sort oldest -> newest
+    klines.sort(key=lambda x: int(x[0]))
+
+    return klines
 
 def get_5m_price_impact(symbol):
-    klines = get_5m_klines(symbol, limit=2)
+    klines = get_5m_klines(symbol, limit=3)
 
     if len(klines) < 2:
         return 0
 
+    # Use latest closed candle, not currently forming candle
     last_closed = klines[-2]
 
     open_price = float(last_closed[1])
@@ -74,43 +120,55 @@ def get_5m_price_impact(symbol):
     return abs((close_price - open_price) / open_price * 100)
 
 def get_5m_volume_spike(symbol):
-    klines = get_5m_klines(symbol, limit=13)
+    klines = get_5m_klines(symbol, limit=14)
 
     if len(klines) < 13:
         return 0
 
+    # Remove current forming candle
     closed_klines = klines[:-1]
 
-    latest_volume = float(closed_klines[-1][7])
-    previous_volumes = [float(k[7]) for k in closed_klines[:-1]]
+    # Bybit kline fields:
+    # [startTime, open, high, low, close, volume, turnover]
+    latest_turnover = float(closed_klines[-1][6])
+    previous_turnovers = [float(k[6]) for k in closed_klines[:-1]]
 
-    avg_volume = sum(previous_volumes) / len(previous_volumes)
+    avg_turnover = sum(previous_turnovers) / len(previous_turnovers)
 
-    if avg_volume == 0:
+    if avg_turnover == 0:
         return 0
 
-    return latest_volume / avg_volume
+    return latest_turnover / avg_turnover
 
 def get_open_interest_spike(symbol):
-    url = (
-        "https://fapi.binance.com/futures/data/openInterestHist"
-        f"?symbol={symbol}"
-        "&period=5m"
-        "&limit=2"
-    )
+    url = "https://api.bybit.com/v5/market/open-interest"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "intervalTime": "5min",
+        "limit": 2,
+    }
 
-    data = get_json(url)
+    data = get_json(url, params=params)
+    oi_list = data["result"].get("list", [])
 
-    if len(data) < 2:
+    if len(oi_list) < 2:
         return 0
 
-    old_oi = float(data[0]["sumOpenInterest"])
-    new_oi = float(data[1]["sumOpenInterest"])
+    # Sort oldest -> newest
+    oi_list.sort(key=lambda x: int(x["timestamp"]))
+
+    old_oi = float(oi_list[0]["openInterest"])
+    new_oi = float(oi_list[-1]["openInterest"])
 
     if old_oi == 0:
         return 0
 
     return ((new_oi - old_oi) / old_oi) * 100
+
+# =========================================================
+# SIGNAL THRESHOLDS
+# =========================================================
 
 def get_funding_threshold(market_cap):
     if market_cap < 1_000_000_000:
@@ -122,24 +180,25 @@ def get_funding_threshold(market_cap):
     else:
         return -0.0003, "Large Cap > $10B"
 
+# =========================================================
+# MAIN SCANNER
+# =========================================================
+
 async def scan_market():
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID environment variable.")
+        raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID GitHub secret.")
 
-    print("Fetching market data...")
+    print("Fetching market data from Bybit...")
 
     market_caps = get_market_caps()
-    funding_data = get_funding_data()
-    ticker_data = get_ticker_data()
+    ticker_data = get_bybit_tickers()
 
     candidates_found = 0
+    checked_symbols = 0
 
-    for coin in funding_data:
+    for symbol, ticker in ticker_data.items():
         try:
-            symbol = coin["symbol"]
-
-            if not symbol.endswith("USDT"):
-                continue
+            checked_symbols += 1
 
             base_symbol = symbol.replace("USDT", "").upper()
             market_cap = market_caps.get(base_symbol, 0)
@@ -147,16 +206,12 @@ async def scan_market():
             if market_cap <= 0:
                 continue
 
-            if symbol not in ticker_data:
-                continue
-
-            ticker = ticker_data[symbol]
-            volume_24h = float(ticker["quoteVolume"])
+            volume_24h = float(ticker.get("turnover24h", 0) or 0)
 
             if volume_24h < MIN_24H_VOLUME:
                 continue
 
-            funding = float(coin["lastFundingRate"])
+            funding = float(ticker.get("fundingRate", 0) or 0)
             funding_threshold, cap_tier = get_funding_threshold(market_cap)
 
             if funding > funding_threshold:
@@ -180,7 +235,7 @@ async def scan_market():
             candidates_found += 1
 
             message = f"""
-🚨 EXTREME PERP SIGNAL
+🚨 EXTREME BYBIT PERP SIGNAL
 
 Coin: {symbol}
 Tier: {cap_tier}
@@ -192,7 +247,7 @@ Required Funding: {funding_threshold * 100:.4f}%
 5m OI Spike: +{oi_spike:.2f}%
 5m Volume Spike: {volume_spike:.2f}x
 
-24h Volume: ${volume_24h:,.0f}
+24h Bybit Turnover: ${volume_24h:,.0f}
 Market Cap: ${market_cap:,.0f}
 
 Possible aggressive positioning imbalance detected.
@@ -202,8 +257,12 @@ Possible aggressive positioning imbalance detected.
             await send_alert(message)
 
         except Exception as e:
-            print(f"Error processing {coin.get('symbol', 'UNKNOWN')}: {e}")
+            print(f"Error processing {symbol}: {e}")
 
-    print(f"Scan completed. Candidates found: {candidates_found}")
+    print(f"Scan completed. Checked symbols: {checked_symbols}. Candidates found: {candidates_found}")
+
+# =========================================================
+# START
+# =========================================================
 
 asyncio.run(scan_market())
