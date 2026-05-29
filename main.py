@@ -1,4 +1,6 @@
 import os
+import json
+import time
 import requests
 import asyncio
 from telegram import Bot
@@ -9,8 +11,11 @@ from telegram import Bot
 
 PRICE_IMPACT_THRESHOLD = 5.0          # 5m price impact >= 5%
 OI_SPIKE_THRESHOLD = 2.0              # 5m open interest increase >= 2%
-VOLUME_SPIKE_MULTIPLIER = 2.0         # latest closed 5m volume >= 2x previous average
 MIN_24H_VOLUME = 10_000_000           # Bybit 24h turnover must be >= $10M
+
+COOLDOWN_HOURS = 8
+COOLDOWN_SECONDS = COOLDOWN_HOURS * 60 * 60
+COOLDOWN_FILE = "cooldown_state.json"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -23,6 +28,51 @@ bot = Bot(token=TELEGRAM_TOKEN)
 
 async def send_alert(message):
     await bot.send_message(chat_id=CHAT_ID, text=message)
+
+# =========================================================
+# COOLDOWN STORAGE
+# =========================================================
+
+def load_cooldowns():
+    if not os.path.exists(COOLDOWN_FILE):
+        return {}
+
+    try:
+        with open(COOLDOWN_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_cooldowns(cooldowns):
+    with open(COOLDOWN_FILE, "w") as f:
+        json.dump(cooldowns, f, indent=2)
+
+def is_on_cooldown(symbol, cooldowns):
+    last_alert_time = cooldowns.get(symbol)
+
+    if not last_alert_time:
+        return False
+
+    elapsed = time.time() - float(last_alert_time)
+
+    return elapsed < COOLDOWN_SECONDS
+
+def update_cooldown(symbol, cooldowns):
+    cooldowns[symbol] = time.time()
+    save_cooldowns(cooldowns)
+
+def clean_old_cooldowns(cooldowns):
+    now = time.time()
+
+    cleaned = {
+        symbol: timestamp
+        for symbol, timestamp in cooldowns.items()
+        if now - float(timestamp) < COOLDOWN_SECONDS
+    }
+
+    save_cooldowns(cleaned)
+
+    return cleaned
 
 # =========================================================
 # HTTP HELPERS
@@ -85,7 +135,7 @@ def get_bybit_tickers():
 
     return ticker_map
 
-def get_5m_klines(symbol, limit=13):
+def get_5m_klines(symbol, limit=3):
     url = "https://api.bybit.com/v5/market/kline"
     params = {
         "category": "linear",
@@ -118,27 +168,6 @@ def get_5m_price_impact(symbol):
         return 0
 
     return abs((close_price - open_price) / open_price * 100)
-
-def get_5m_volume_spike(symbol):
-    klines = get_5m_klines(symbol, limit=14)
-
-    if len(klines) < 13:
-        return 0
-
-    # Remove current forming candle
-    closed_klines = klines[:-1]
-
-    # Bybit kline fields:
-    # [startTime, open, high, low, close, volume, turnover]
-    latest_turnover = float(closed_klines[-1][6])
-    previous_turnovers = [float(k[6]) for k in closed_klines[:-1]]
-
-    avg_turnover = sum(previous_turnovers) / len(previous_turnovers)
-
-    if avg_turnover == 0:
-        return 0
-
-    return latest_turnover / avg_turnover
 
 def get_open_interest_spike(symbol):
     url = "https://api.bybit.com/v5/market/open-interest"
@@ -186,19 +215,31 @@ def get_funding_threshold(market_cap):
 
 async def scan_market():
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID GitHub secret.")
+        raise ValueError("Missing TELEGRAM_TOKEN or CHAT_ID environment variable.")
 
     print("Fetching market data from Bybit...")
+
+    cooldowns = load_cooldowns()
+    cooldowns = clean_old_cooldowns(cooldowns)
 
     market_caps = get_market_caps()
     ticker_data = get_bybit_tickers()
 
     candidates_found = 0
     checked_symbols = 0
+    skipped_cooldown = 0
 
     for symbol, ticker in ticker_data.items():
         try:
             checked_symbols += 1
+
+            # =================================================
+            # COOLDOWN FILTER
+            # =================================================
+
+            if is_on_cooldown(symbol, cooldowns):
+                skipped_cooldown += 1
+                continue
 
             base_symbol = symbol.replace("USDT", "").upper()
             market_cap = market_caps.get(base_symbol, 0)
@@ -206,10 +247,18 @@ async def scan_market():
             if market_cap <= 0:
                 continue
 
+            # =================================================
+            # 24H VOLUME FILTER
+            # =================================================
+
             volume_24h = float(ticker.get("turnover24h", 0) or 0)
 
             if volume_24h < MIN_24H_VOLUME:
                 continue
+
+            # =================================================
+            # FUNDING FILTER
+            # =================================================
 
             funding = float(ticker.get("fundingRate", 0) or 0)
             funding_threshold, cap_tier = get_funding_threshold(market_cap)
@@ -217,19 +266,22 @@ async def scan_market():
             if funding > funding_threshold:
                 continue
 
+            # =================================================
+            # PRICE IMPACT FILTER
+            # =================================================
+
             price_impact = get_5m_price_impact(symbol)
 
             if price_impact < PRICE_IMPACT_THRESHOLD:
                 continue
 
+            # =================================================
+            # OPEN INTEREST FILTER
+            # =================================================
+
             oi_spike = get_open_interest_spike(symbol)
 
             if oi_spike < OI_SPIKE_THRESHOLD:
-                continue
-
-            volume_spike = get_5m_volume_spike(symbol)
-
-            if volume_spike < VOLUME_SPIKE_MULTIPLIER:
                 continue
 
             candidates_found += 1
@@ -245,10 +297,11 @@ Required Funding: {funding_threshold * 100:.4f}%
 
 5m Price Impact: {price_impact:.2f}%
 5m OI Spike: +{oi_spike:.2f}%
-5m Volume Spike: {volume_spike:.2f}x
 
 24h Bybit Turnover: ${volume_24h:,.0f}
 Market Cap: ${market_cap:,.0f}
+
+Cooldown: {COOLDOWN_HOURS} hours
 
 Possible aggressive positioning imbalance detected.
 """
@@ -256,10 +309,17 @@ Possible aggressive positioning imbalance detected.
             print(message)
             await send_alert(message)
 
+            # Start 8-hour cooldown only after successful alert
+            update_cooldown(symbol, cooldowns)
+
         except Exception as e:
             print(f"Error processing {symbol}: {e}")
 
-    print(f"Scan completed. Checked symbols: {checked_symbols}. Candidates found: {candidates_found}")
+    print(
+        f"Scan completed. Checked symbols: {checked_symbols}. "
+        f"Candidates found: {candidates_found}. "
+        f"Skipped by cooldown: {skipped_cooldown}."
+    )
 
 # =========================================================
 # START
